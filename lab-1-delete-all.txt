@@ -1,0 +1,28 @@
+configure
+delete rulebase security rules Allow-Clients-DC
+delete rulebase security rules Allow-Admin
+delete rulebase security rules Deny-All-Log
+delete rulebase nat rules NoNAT-Clients-Servers
+delete rulebase nat rules NAT-Out-Clients
+delete address-group GRP-WIN-CLIENTS
+delete address-group GRP-OLD
+delete service-group SG-ADMIN
+delete service-group SG-OLD
+delete address WIN-CLIENT-01
+delete address WIN-CLIENT-02
+delete address SRV-DC01
+delete address SRV-ADMIN
+delete address NET-SERVERS
+delete address PUB-POOL
+delete address SRV-OLD01
+delete address SRV-OLD02
+delete address NET-OLD
+delete service TCP-389
+delete service TCP-445
+delete service TCP-3389
+delete service TCP-5985
+delete service TCP-8080-OLD
+delete service UDP-54
+delete tag TAG-LAB
+delete tag TAG-OLD
+commit

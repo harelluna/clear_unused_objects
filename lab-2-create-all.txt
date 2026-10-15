@@ -1,0 +1,29 @@
+configure
+set tag TAG-LAB color color1
+set tag TAG-OLD color color2
+set address WIN-CLIENT-01 ip-netmask 10.10.20.10/32
+set address WIN-CLIENT-02 ip-netmask 10.10.30.10/32
+set address SRV-DC01 ip-netmask 10.10.10.5/32
+set address SRV-ADMIN ip-netmask 192.168.99.10/32
+set address NET-SERVERS ip-netmask 10.10.10.0/24
+set address PUB-POOL ip-netmask 203.0.113.50/32
+set address SRV-OLD01 ip-netmask 10.10.50.10/32
+set address SRV-OLD02 ip-netmask 10.10.50.11/32
+set address NET-OLD ip-netmask 172.16.99.0/24
+set address-group GRP-WIN-CLIENTS static [ WIN-CLIENT-01 WIN-CLIENT-02 ]
+set address-group GRP-OLD static [ SRV-OLD01 SRV-OLD02 ]
+set service TCP-389 protocol tcp port 389
+set service TCP-445 protocol tcp port 445
+set service TCP-3389 protocol tcp port 3389
+set service TCP-5985 protocol tcp port 5985
+set service TCP-8080-OLD protocol tcp port 8080
+set service UDP-54 protocol udp port 54
+set service-group SG-ADMIN members [ TCP-3389 TCP-5985 ]
+set service-group SG-OLD members [ TCP-8080-OLD ]
+set rulebase security rules Allow-Clients-DC from trust to dmz source GRP-WIN-CLIENTS destination SRV-DC01 application any service [ TCP-389 TCP-445 ] action allow log-end yes tag TAG-LAB
+set rulebase security rules Allow-Admin from mgmt to trust source SRV-ADMIN destination GRP-WIN-CLIENTS application any service SG-ADMIN action allow log-end yes
+set rulebase security rules Deny-All-Log from any to any source any destination any application any service any action deny log-end yes rule-type interzone
+move rulebase security rules Deny-All-Log bottom
+set rulebase nat rules NoNAT-Clients-Servers from trust to dmz source GRP-WIN-CLIENTS destination NET-SERVERS service any
+set rulebase nat rules NAT-Out-Clients from trust to untrust source GRP-WIN-CLIENTS destination any service any source-translation dynamic-ip-and-port translated-address PUB-POOL
+commit
