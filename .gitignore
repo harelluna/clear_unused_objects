@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local firewall exports, backups and generated cleanup plans
+backups/
+backup-*.xml
+*.local.xml
+*.plan.json

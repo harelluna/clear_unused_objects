@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Synthetic candidate configuration matching lab-2-create-all.txt. -->
+<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">
+  <tag><entry name="TAG-LAB"><color>color1</color></entry><entry name="TAG-OLD"><color>color2</color></entry></tag>
+  <address>
+    <entry name="WIN-CLIENT-01"><ip-netmask>10.10.20.10/32</ip-netmask></entry>
+    <entry name="WIN-CLIENT-02"><ip-netmask>10.10.30.10/32</ip-netmask></entry>
+    <entry name="SRV-DC01"><ip-netmask>10.10.10.5/32</ip-netmask></entry>
+    <entry name="SRV-ADMIN"><ip-netmask>192.168.99.10/32</ip-netmask></entry>
+    <entry name="NET-SERVERS"><ip-netmask>10.10.10.0/24</ip-netmask></entry>
+    <entry name="PUB-POOL"><ip-netmask>203.0.113.50/32</ip-netmask></entry>
+    <entry name="SRV-OLD01"><ip-netmask>10.10.50.10/32</ip-netmask></entry>
+    <entry name="SRV-OLD02"><ip-netmask>10.10.50.11/32</ip-netmask></entry>
+    <entry name="NET-OLD"><ip-netmask>172.16.99.0/24</ip-netmask></entry>
+  </address>
+  <address-group>
+    <entry name="GRP-WIN-CLIENTS"><static><member>WIN-CLIENT-01</member><member>WIN-CLIENT-02</member></static></entry>
+    <entry name="GRP-OLD"><static><member>SRV-OLD01</member><member>SRV-OLD02</member></static></entry>
+  </address-group>
+  <service>
+    <entry name="TCP-389"><protocol><tcp><port>389</port></tcp></protocol></entry>
+    <entry name="TCP-445"><protocol><tcp><port>445</port></tcp></protocol></entry>
+    <entry name="TCP-3389"><protocol><tcp><port>3389</port></tcp></protocol></entry>
+    <entry name="TCP-5985"><protocol><tcp><port>5985</port></tcp></protocol></entry>
+    <entry name="TCP-8080-OLD"><protocol><tcp><port>8080</port></tcp></protocol></entry>
+    <entry name="UDP-54"><protocol><udp><port>54</port></udp></protocol></entry>
+  </service>
+  <service-group>
+    <entry name="SG-ADMIN"><members><member>TCP-3389</member><member>TCP-5985</member></members></entry>
+    <entry name="SG-OLD"><members><member>TCP-8080-OLD</member></members></entry>
+  </service-group>
+  <rulebase>
+    <security><rules>
+      <entry name="Allow-Clients-DC">
+        <from><member>trust</member></from><to><member>dmz</member></to>
+        <source><member>GRP-WIN-CLIENTS</member></source><destination><member>SRV-DC01</member></destination>
+        <application><member>any</member></application><service><member>TCP-389</member><member>TCP-445</member></service>
+        <action>allow</action><tag><member>TAG-LAB</member></tag>
+      </entry>
+      <entry name="Allow-Admin">
+        <from><member>mgmt</member></from><to><member>trust</member></to>
+        <source><member>192.168.99.10</member></source><destination><member>GRP-WIN-CLIENTS</member></destination>
+        <application><member>any</member></application><service><member>SG-ADMIN</member></service><action>allow</action>
+      </entry>
+      <entry name="Deny-All-Log">
+        <source><member>any</member></source><destination><member>any</member></destination>
+        <application><member>any</member></application><service><member>any</member></service><action>deny</action>
+      </entry>
+    </rules></security>
+    <nat><rules>
+      <entry name="NoNAT-Clients-Servers"><source><member>GRP-WIN-CLIENTS</member></source><destination><member>NET-SERVERS</member></destination><service>any</service></entry>
+      <entry name="NAT-Out-Clients"><source><member>GRP-WIN-CLIENTS</member></source><destination><member>any</member></destination><service>any</service><source-translation><dynamic-ip-and-port><translated-address><member>PUB-POOL</member></translated-address></dynamic-ip-and-port></source-translation></entry>
+    </rules></nat>
+  </rulebase>
+</entry></vsys></entry></devices></config>

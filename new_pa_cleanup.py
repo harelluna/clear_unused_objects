@@ -1,142 +1,377 @@
-"""
-pa_cleanup.py - delete unused objects on a Palo Alto firewall or Panorama (uses pan-os-python).
-Install:  pip install pan-os-python
-Edit the settings, then run:  python3 pa_cleanup.py
-The result is printed on the screen.
-"""
-import re, time
-import xml.etree.ElementTree as ET
+"""Plan and optionally delete unused PAN-OS objects. Default: read-only dry run."""
+
+import argparse
 from collections import defaultdict
-from panos.firewall import Firewall
-from panos.panorama import Panorama
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import getpass
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import ssl
+import sys
+import xml.etree.ElementTree as ET
 
-# ------------------------- SETTINGS -------------------------
-HOST = "192.168.1.1"
-USER = "admin"
-PASSWORD = "change-me"
-VSYS = "vsys1"            # firewall: which vsys to clean
-DEVICE_GROUP = ""         # "" = firewall. Name of a device group = connect to Panorama and clean that group
-
-DRY_RUN = True            # True = only show what would be deleted
-DELETE_ALL = False        # True = delete ALL objects and ALL rules (not only the unused ones)
-COMMIT = False            # True = commit after deleting
-KEEP = set()              # names that must never be deleted, e.g. {"SRV-DC01"}
-# ------------------------------------------------------------
-
-TYPES = ["address", "address-group", "service", "service-group", "tag"]
-if DEVICE_GROUP:
-    BASE = f"/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name='{DEVICE_GROUP}']"
-else:
-    BASE = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='{VSYS}']"
-
-WHO = {"<rule>": "a rule", "<other>": "other settings", "<keep>": "your KEEP list"}
+from pan.xapi import PanXapi, PanXapiError
 
 
-def analyze(cfg):
-    """Return (rules, layers, objects, users). layers[0] = unused now, layers[1] = unused once layer 0 is gone, ..."""
-    if DEVICE_GROUP:
-        scope = cfg.find(f".//device-group/entry[@name='{DEVICE_GROUP}']")
-    else:
-        scope = cfg.find(f".//vsys/entry[@name='{VSYS}']")
-    objects = {e.get("name"): (t, e) for t in TYPES for e in scope.findall(f"{t}/entry")}  # name -> (type, element)
-    owner_of = {e: name for name, (t, e) in objects.items()}
-    parent = {child: p for p in cfg.iter() for child in p}
+TYPES = ("address", "address-group", "service", "service-group", "tag")
+ADDRESS_TYPES = {"address", "address-group"}
+SERVICE_TYPES = {"service", "service-group"}
+ADDRESS_FIELDS = {
+    "source", "destination", "source-address", "destination-address",
+    "translated-address",
+}
 
-    def who(el):
-        """What contains this element: an object name, '<rule>' or '<other>'."""
-        in_rule = False
-        while el is not None:
-            if el in owner_of:
-                return owner_of[el]
-            in_rule = in_rule or el.tag.endswith("rulebase")
-            el = parent.get(el)
-        return "<rule>" if in_rule else "<other>"
 
-    # users[x] = everything that points at x
-    users = defaultdict(set)
-    for el in cfg.iter():
-        text = (el.text or "").strip()
-        if text:
-            for name in {text, *re.findall(r"'([^']+)'", text)}:     # 2nd part: dynamic group filters
-                if name in objects and who(el) != name:
-                    users[name].add(who(el))
-    for name in KEEP:
-        users[name].add("<keep>")
+@dataclass(frozen=True, order=True)
+class ObjectKey:
+    kind: str
+    name: str
 
-    rules = [(rb.tag, s.tag, r.get("name")) for rb in scope if rb.tag.endswith("rulebase")
-             for s in rb for r in s.findall("rules/entry")]
-    if DELETE_ALL:
-        for u in users.values():
-            u.discard("<rule>")            # the rules are going away, so they no longer count
+    def __str__(self):
+        return f"{self.kind} {self.name}"
+
+
+@dataclass
+class Plan:
+    base: str
+    objects: dict
+    users: dict
+    rules: list
+    layers: list
+
+    @property
+    def deleting(self):
+        return {key for layer in self.layers for key in layer}
+
+    def object_path(self, key):
+        return f"{self.base}/{key.kind}/entry[@name={xpath_literal(key.name)}]"
+
+    @property
+    def paths(self):
+        return self.rules + [self.object_path(key) for layer in self.layers for key in layer]
+
+
+def xpath_literal(value):
+    """Do not interpolate unescaped names into an API XPath."""
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    raise ValueError("An XPath name cannot contain both single and double quotes")
+
+
+def config_element(root):
+    """Accept an exported config or the usual XML API response/result wrapper."""
+    if root is None:
+        raise ValueError("The device returned no configuration")
+    if root.tag == "config":
+        return root
+    configs = root.findall(".//config")
+    if len(configs) != 1:
+        raise ValueError("Expected exactly one <config> element")
+    return configs[0]
+
+
+def analyze(cfg, *, vsys="vsys1", device_group=None, keep=(), delete_all=False):
+    """Build a conservative dependency graph; never contact or modify a device.
+
+    Unrecognised reference fields and references outside the selected scope
+    retain matching objects. This may keep extra objects instead of guessing.
+    """
+    cfg = config_element(cfg)
+    scope_type, scope_name = ("device-group", device_group) if device_group else ("vsys", vsys)
+    matches = [
+        (device, scope)
+        for device in cfg.findall("./devices/entry")
+        for scope in device.findall(f"./{scope_type}/entry")
+        if scope.get("name") == scope_name
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Expected one {scope_type} named {scope_name!r}; found {len(matches)}")
+    device, scope = matches[0]
+    device_name = device.get("name")
+    if not device_name:
+        raise ValueError("The device entry has no name")
+    base = (f"/config/devices/entry[@name={xpath_literal(device_name)}]"
+            f"/{scope_type}/entry[@name={xpath_literal(scope_name)}]")
+    objects = {}
+    for kind in TYPES:
+        for entry in scope.findall(f"{kind}/entry"):
+            name = entry.get("name")
+            if not name:
+                raise ValueError(f"An entry in {kind} has no name")
+            xpath_literal(name)
+            key = ObjectKey(kind, name)
+            if key in objects:
+                raise ValueError(f"Duplicate object: {key}")
+            objects[key] = entry
+
+    parent = {child: node for node in cfg.iter() for child in node}
+    owner_of = {entry: key for key, entry in objects.items()}
+
+    def xml_path(element):
+        parts = []
+        while element is not None:
+            part = element.tag
+            if element.tag == "entry" and element.get("name") is not None:
+                part += f"[@name={xpath_literal(element.get('name'))}]"
+            parts.append(part)
+            element = parent.get(element)
+        return "/" + "/".join(reversed(parts))
+
+    # Each rule has its own identity, including its device and scope.
+    rule_owner = {}
+    for rb in cfg.iter():
+        if rb.tag in {"rulebase", "pre-rulebase", "post-rulebase"}:
+            for section in rb:
+                for rule in section.findall("rules/entry"):
+                    rule_owner[rule] = "rule " + xml_path(rule)
+    rules = []
+    if delete_all:
+        for rb in scope:
+            if rb.tag in {"rulebase", "pre-rulebase", "post-rulebase"}:
+                for section in rb:
+                    rules.extend(xml_path(rule) for rule in section.findall("rules/entry"))
+    removing_rules = {"rule " + path for path in rules}
+
+    def owner(element):
+        while element is not None:
+            if element in owner_of:
+                return owner_of[element]
+            if element in rule_owner:
+                return rule_owner[element]
+            element = parent.get(element)
+        return "other settings or an object outside the selected scope"
+
+    def reference_types(element):
+        container = parent.get(element)
+        field = container.tag if element.tag == "member" and container is not None else element.tag
+        if field == "tag" or element.tag == "filter":
+            return {"tag"}
+        if field == "service":
+            return SERVICE_TYPES
+        if field in ADDRESS_FIELDS or field == "static":
+            return ADDRESS_TYPES
+        if field == "members" and container is not None:
+            entry = parent.get(container)
+            group = parent.get(entry)
+            if group is not None and group.tag == "service-group":
+                return SERVICE_TYPES
+        return set(TYPES)  # Unknown fields are intentionally conservative.
+
+    by_name = defaultdict(list)
+    for key in objects:
+        by_name[key.name].append(key)
+    users = {key: set() for key in objects}
+    for element in cfg.iter():
+        text = (element.text or "").strip()
+        if not text or element.tag == "description":
+            continue
+        names = {text}
+        if element.tag == "filter":
+            names.update(match[1] for match in re.findall(r"(['\"])(.*?)\1", text))
+        who = owner(element)
+        if who in removing_rules:
+            continue
+        kinds = reference_types(element)
+        for name in names:
+            for key in by_name.get(name, ()):
+                if key.kind in kinds:
+                    users[key].add(who)
+    for name in keep:
+        if name not in by_name:
+            raise ValueError(f"KEEP object {name!r} does not exist in the selected scope")
+        for key in by_name[name]:
+            users[key].add("KEEP list")
+
+    # Dynamic groups can use tagged addresses without naming them in XML.
+    # Filters can contain NOT, so matching just the quoted tags is insufficient.
+    # Without runtime membership data, keep all address candidates while any
+    # such group remains. An unused dynamic group can still be deleted first.
+    for group, entry in objects.items():
+        if group.kind == "address-group" and entry.find("dynamic/filter") is not None:
+            for key in objects:
+                if key.kind in ADDRESS_TYPES and key != group:
+                    users[key].add(group)
 
     gone, layers = set(), []
     while True:
-        layer = [n for n in objects if n not in gone and users[n] <= gone]   # everything pointing at it is gone
+        layer = sorted(key for key in objects if key not in gone and users[key] <= gone)
         if not layer:
-            return (rules if DELETE_ALL else []), layers, objects, users
+            break
         layers.append(layer)
         gone.update(layer)
+    return Plan(base, objects, users, sorted(rules), layers)
 
 
-def main():
-    print("=" * 60)
-    print(f"Firewall: {HOST}   Scope: {'device group ' + DEVICE_GROUP if DEVICE_GROUP else VSYS}")
-    print("Mode:    ", "DELETE ALL (rules and objects)" if DELETE_ALL else "delete unused objects only")
-    print("Dry run: ", "YES - nothing will be changed" if DRY_RUN else "NO - changes will be made")
-    print("=" * 60)
+def print_plan(plan):
+    for key in sorted(plan.objects.keys() - plan.deleting):
+        reasons = ", ".join(sorted(str(user) for user in plan.users[key]))
+        print(f"KEEP    {key}: {reasons}")
+    for path in plan.rules:
+        print(f"DELETE  rule {path}")
+    for number, layer in enumerate(plan.layers, 1):
+        for key in layer:
+            print(f"DELETE  layer {number}: {key}")
+    print(f"SUMMARY: {len(plan.objects)} objects; {len(plan.deleting)} eligible for deletion; "
+          f"{len(plan.objects) - len(plan.deleting)} kept; {len(plan.rules)} rules to delete")
 
-    device = Panorama(HOST, USER, PASSWORD) if DEVICE_GROUP else Firewall(HOST, USER, PASSWORD)
-    device.xapi.get("/config")
-    cfg = device.xapi.element_result.find("config")
-    backup = f"backup-{time.strftime('%Y%m%d-%H%M%S')}.xml"
-    open(backup, "wb").write(ET.tostring(cfg))
-    print(f"Config downloaded. Backup saved to: {backup}\n")
 
-    rules, layers, objects, users = analyze(cfg)
-    deleting = {n for layer in layers for n in layer}
+def write_private(path, content):
+    """Create a new file; never overwrite a backup or an existing user file."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(content)
 
-    print(f"KEEP - still in use ({len(objects) - len(deleting)} objects)")
-    for name in objects:
-        if name not in deleting:
-            by = ", ".join(WHO.get(u, "object " + u) for u in sorted(users[name]))
-            print(f"  {objects[name][0]:<14} {name:<28} used by: {by}")
 
-    if rules:
-        print(f"\nDELETE - {len(rules)} rules")
-        for rb, sec, name in rules:
-            print(f"  rule  {sec:<10} {name}")
-    for i, layer in enumerate(layers, 1):
-        note = "nothing uses them" if i == 1 else "they were only used by the layer before, which is deleted"
-        print(f"\nDELETE - layer {i} ({note})")
-        for name in layer:
-            print(f"  {objects[name][0]:<14} {name}")
+def fingerprint(cfg):
+    return hashlib.sha256(ET.tostring(cfg)).hexdigest()
 
-    print(f"\nSUMMARY: {len(objects)} objects found, {len(deleting)} to delete, {len(objects) - len(deleting)} kept")
 
-    if DRY_RUN:
-        print("\nDRY RUN finished. Nothing was changed. Set DRY_RUN = False to delete.")
-        return
-    if DELETE_ALL:
-        print("\nWARNING: DELETE_ALL is on. Starting in 5 seconds, press Ctrl+C to stop.")
-        time.sleep(5)
+def read_device_config(api):
+    api.get("/config")
+    return config_element(api.element_result)
 
-    print()
-    for rb, sec, name in rules:
-        device.xapi.delete(f"{BASE}/{rb}/{sec}/rules/entry[@name='{name}']")
-        print(f"deleted rule   {name}")
-    for layer in layers:
-        for name in layer:
-            kind = objects[name][0]
-            device.xapi.delete(f"{BASE}/{kind}/entry[@name='{name}']")
-            print(f"deleted {kind:<14} {name}")
 
-    if COMMIT:
-        print("\nCommitting, please wait...")
-        device.commit(sync=True)
-        print("Commit finished.")
-    else:
-        print("\nDone. The changes are in the candidate config. Commit them yourself.")
+def connect(args):
+    # pan-python is the XML API client used underneath pan-os-python. Pass a
+    # verified TLS context explicitly; its default context does not verify TLS.
+    context = ssl.create_default_context(cafile=args.ca_bundle)
+    api_key = os.environ.get("PAN_API_KEY")
+    password = None
+    if not api_key:
+        if not args.user:
+            raise ValueError("Supply --user (or PAN_USER), or set PAN_API_KEY")
+        password = os.environ.get("PAN_PASSWORD") or getpass.getpass("Firewall password: ")
+        if not password:
+            raise ValueError("The password cannot be empty")
+    return PanXapi(hostname=args.host, api_username=args.user,
+                   api_password=password, api_key=api_key,
+                   timeout=args.timeout, ssl_context=context)
+
+
+def apply_plan(api, plan, *, commit=False):
+    completed = 0
+    for path in plan.paths:
+        try:
+            api.delete(path)
+        except (Exception, KeyboardInterrupt) as exc:
+            raise RuntimeError(
+                f"Stopped after {completed}/{len(plan.paths)} confirmed deletions. "
+                f"The result of the request for {path} is uncertain. "
+                "Earlier changes may remain in candidate configuration. "
+                "No automatic commit was sent. Inspect the device before retrying."
+            ) from exc
+        completed += 1
+        print(f"DELETED {path}")
+    if commit and completed:
+        try:
+            api.commit(cmd="<commit></commit>", sync=True, timeout=api.timeout)
+            result = api.element_result
+            if result is None or result.findtext(".//job/result") != "OK":
+                raise RuntimeError("Commit did not report a successful job")
+        except (Exception, KeyboardInterrupt) as exc:
+            raise RuntimeError(
+                f"All {completed} deletions completed, but commit failed or its result is unknown. "
+                "Inspect the commit job and candidate configuration on the device."
+            ) from exc
+        print("Commit completed successfully.")
+    elif completed:
+        print("Changes are in candidate configuration. No commit was sent.")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--host", help="Firewall or Panorama management hostname/IP")
+    source.add_argument("--config", type=Path, help="Analyze exported XML offline; no device access")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--vsys", default="vsys1")
+    scope.add_argument("--device-group", help="Select a Panorama device group instead of a VSYS")
+    parser.add_argument("--user", default=os.environ.get("PAN_USER"))
+    parser.add_argument("--keep", action="append", default=[], metavar="NAME")
+    parser.add_argument("--delete-all", action="store_true",
+                        help="Include selected-scope rules; protected objects can still be kept")
+    parser.add_argument("--apply", action="store_true", help="Prompt to execute the displayed plan")
+    parser.add_argument("--commit", action="store_true",
+                        help="With --apply, commit ALL pending candidate changes after success")
+    parser.add_argument("--plan-file", type=Path, help="Save a JSON plan to a new file")
+    parser.add_argument("--backup-dir", type=Path, default=Path("backups"))
+    parser.add_argument("--ca-bundle", help="Trusted CA PEM file for the device certificate")
+    parser.add_argument("--timeout", type=int, default=60)
+    args = parser.parse_args(argv)
+    if args.config and (args.apply or args.commit):
+        parser.error("Offline XML analysis cannot apply changes or commit")
+    if args.commit and not args.apply:
+        parser.error("--commit requires --apply")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        api = None
+        if args.config:
+            cfg = config_element(ET.parse(args.config).getroot())
+        else:
+            api = connect(args)
+            cfg = read_device_config(api)
+            args.backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+            backup = args.backup_dir / f"backup-{stamp}.xml"
+            write_private(backup, ET.tostring(cfg, encoding="utf-8", xml_declaration=True))
+            print(f"Candidate configuration backup: {backup}")
+        digest = fingerprint(cfg)
+        plan = analyze(cfg, vsys=args.vsys, device_group=args.device_group,
+                       keep=args.keep, delete_all=args.delete_all)
+        print(f"Target: {args.host or args.config}   Scope: {plan.base}")
+        print_plan(plan)
+        if args.plan_file:
+            data = {
+                "target": args.host or str(args.config), "scope": plan.base,
+                "config_sha256": digest, "rules": plan.rules,
+                "object_layers": [[{"type": key.kind, "name": key.name,
+                                     "xpath": plan.object_path(key)} for key in layer]
+                                  for layer in plan.layers],
+                "kept": [{"type": key.kind, "name": key.name,
+                          "used_by": sorted(str(user) for user in plan.users[key])}
+                         for key in sorted(plan.objects.keys() - plan.deleting)],
+            }
+            write_private(args.plan_file, json.dumps(data, indent=2).encode("utf-8"))
+        if not args.apply:
+            print("DRY RUN finished. No changes or commit were sent.")
+            return 0
+        if not plan.paths:
+            print("Nothing to delete. No changes or commit were sent.")
+            return 0
+        if args.commit:
+            print("WARNING: Commit includes ALL pending candidate changes, not just this plan.")
+        expected = f"{args.host}/{args.device_group or args.vsys}"
+        if input(f"Type {expected!r} to execute this plan: ").strip() != expected:
+            print("Cancelled. No changes or commit were sent.")
+            return 0
+        if fingerprint(read_device_config(api)) != digest:
+            raise ValueError("Candidate configuration changed after planning. Rerun to create a new plan.")
+        apply_plan(api, plan, commit=args.commit)
+        return 0
+    except PanXapiError:
+        # API exceptions can contain request details: do not print credentials.
+        print("ERROR: Device API request failed. Check authentication, connectivity and TLS trust.",
+              file=sys.stderr)
+        return 1
+    except (OSError, ET.ParseError, ValueError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except (EOFError, KeyboardInterrupt):
+        print("Cancelled. No further requests were sent.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
